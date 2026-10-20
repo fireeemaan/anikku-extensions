@@ -14,13 +14,14 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.ParsedAnimeHttpLegacySource
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.useAsJsoup
-import kotlinx.coroutines.runBlocking
 import okhttp3.FormBody
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -194,7 +195,6 @@ class Kuramanime :
     }
 
     // ============================ Video Links =============================
-    override fun videoListSelector() = "video#player"
 
     private val streamtapeExtractor by lazy { StreamTapeExtractor(client) }
     private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
@@ -202,10 +202,16 @@ class Kuramanime :
     private val vidguardExtractor by lazy { VidGuardExtractor(client) }
 
     /**
-     * The player markup is gated behind a per-session token that the page hands out in two steps, and
-     * the endpoint that finally returns the markup **only accepts `POST`** carrying an `authorization`
-     * form field. Issuing a `GET` (or a POST with an empty body) is answered with the rejection panel
-     * for every server, which is what made this source look permanently dead.
+     * The whole player flow lives here instead of in `videoListParse` because everything past the
+     * first request is asynchronous: the base shim declares `videoListParse` as a plain function, so
+     * driving it required `runBlocking` + `execute()`, and any failure in there (a blocked dispatcher
+     * thread, a slow CDN) was swallowed by `runCatching` and surfaced as an empty list — which the app
+     * renders as "No available videos". `getVideoList` is `open suspend`, so the same logic can use
+     * `awaitSuccess()` and call the extractors' `suspend` functions directly.
+     *
+     * The player markup is gated behind a per-session token handed out in two steps, and the endpoint
+     * that finally returns it **only accepts `POST`** carrying an `authorization` form field *and* the
+     * session cookie set by the episode page.
      *
      * 1. `meta[name=csrf-token]`, `input#checkEp` (its value is the page-index endpoint) and
      *    `[data-kk]` (id of the generated JS holding `window.process.env`) come from the episode page.
@@ -214,20 +220,23 @@ class Kuramanime :
      * 4. `GET /<MIX_PREFIX_AUTH_ROUTE_PARAM><MIX_AUTH_ROUTE_PARAM>` with `X-Fuck-ID` -> the token.
      * 5. `POST <episodeUrl>?<token>=…&<server>=…&page=…` with `authorization` in the body.
      *
-     * Step 5 is also rejected unless the request carries the session cookie handed out by the episode
-     * page, so the cookies are harvested from `Set-Cookie` and replayed explicitly instead of relying
-     * on the shared client's cookie jar.
+     * Each step throws with a short reason when it cannot proceed, so a failure shows up in the app as
+     * a readable message instead of a silent empty list.
      */
-    override fun videoListParse(response: Response): List<Video> {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+        val episodeUrl = joinUrl(episode.url)
         val cookies = mutableMapOf<String, String>()
-        cookies.harvest(response)
 
-        val doc = response.useAsJsoup()
-        val episodeUrl = response.request.url
+        val pageResponse = client.newCall(GET(episodeUrl, headers)).awaitSuccess()
+        cookies.harvest(pageResponse)
+        val doc = pageResponse.useAsJsoup()
 
-        val csrfToken = doc.selectFirst("meta[name=csrf-token]")?.attr("content") ?: return emptyList()
-        val checkUrl = doc.selectFirst("input#checkEp")?.attr("value") ?: return emptyList()
-        val jsRouteParam = doc.selectFirst("[$JS_ROUTE_ATTR]")?.attr(JS_ROUTE_ATTR) ?: return emptyList()
+        val csrfToken = doc.selectFirst("meta[name=csrf-token]")?.attr("content")
+            ?: fail("episode page has no csrf-token (url=$episodeUrl)")
+        val checkUrl = doc.selectFirst("input#checkEp")?.attr("value")
+            ?: fail("episode page has no input#checkEp (url=$episodeUrl)")
+        val jsRouteParam = doc.selectFirst("[$JS_ROUTE_ATTR]")?.attr(JS_ROUTE_ATTR)
+            ?: fail("episode page has no [$JS_ROUTE_ATTR]")
 
         val page = runCatching {
             client.newCall(
@@ -239,23 +248,30 @@ class Kuramanime :
                         .build(),
                 ),
             )
-                .execute()
+                .awaitSuccess()
                 .use { it.cookiesInto(cookies) }
                 .filter(Char::isDigit)
                 .ifBlank { "1" }
         }.getOrDefault("1")
 
         val env = runCatching {
-            client.newCall(GET("$baseUrl/assets/js/$jsRouteParam.js", headers))
-                .execute()
+            client.newCall(
+                GET(
+                    "$baseUrl/assets/js/$jsRouteParam.js",
+                    headersBuilder().set("Cookie", cookies.toCookieHeader()).build(),
+                ),
+            )
+                .awaitSuccess()
                 .bodyString()
                 .let(::parseEnv)
         }.getOrNull().orEmpty()
 
-        val tokenParam = env["MIX_PAGE_TOKEN_KEY"] ?: return emptyList()
-        val serverParam = env["MIX_STREAM_SERVER_KEY"] ?: return emptyList()
+        if (env.isEmpty()) fail("env JS is empty (data-kk=$jsRouteParam)")
+
+        val tokenParam = env["MIX_PAGE_TOKEN_KEY"] ?: fail("env has no MIX_PAGE_TOKEN_KEY")
+        val serverParam = env["MIX_STREAM_SERVER_KEY"] ?: fail("env has no MIX_STREAM_SERVER_KEY")
         val authPath = (env["MIX_PREFIX_AUTH_ROUTE_PARAM"] ?: "") + (env["MIX_AUTH_ROUTE_PARAM"] ?: "")
-        if (authPath.isBlank()) return emptyList()
+        if (authPath.isBlank()) fail("env has no auth route params")
 
         val token = runCatching {
             val tokenHeaders = headersBuilder()
@@ -266,19 +282,20 @@ class Kuramanime :
                 .build()
 
             client.newCall(GET("$baseUrl/$authPath", tokenHeaders))
-                .execute()
+                .awaitSuccess()
                 .use { it.cookiesInto(cookies) }
                 .trim('"', ' ', '\n', '\r')
         }.getOrNull().orEmpty()
-        if (token.isBlank()) return emptyList()
+
+        if (token.isBlank()) fail("token request returned blank ($authPath)")
 
         val servers = doc.select("select#changeServer > option")
             .map { it.attr("value") }
             .filter(String::isNotBlank)
-        if (servers.isEmpty()) return emptyList()
+        if (servers.isEmpty()) fail("episode page has no select#changeServer options")
 
         val playerHeaders = headersBuilder()
-            .set("Referer", episodeUrl.toString())
+            .set("Referer", episodeUrl)
             .set("X-Requested-With", "XMLHttpRequest")
             .set("X-CSRF-TOKEN", csrfToken)
             .set("Accept", "text/html, */*; q=0.01")
@@ -291,8 +308,9 @@ class Kuramanime :
             .add("authorization", AUTH_SIGNATURE)
             .build()
 
+        var lastRejected = 0
         for (server in servers) {
-            val playerUrl = episodeUrl.newBuilder()
+            val playerUrl = episodeUrl.toHttpUrl().newBuilder()
                 .addQueryParameter(tokenParam, token)
                 .addQueryParameter(serverParam, server)
                 .addQueryParameter("page", page)
@@ -300,16 +318,15 @@ class Kuramanime :
                 .toString()
 
             val videos = runCatching {
-                runBlocking {
-                    val body = client.newCall(POST(playerUrl, body = authBody, headers = playerHeaders))
-                        .execute()
-                        .bodyString()
+                val body = client.newCall(POST(playerUrl, body = authBody, headers = playerHeaders))
+                    .awaitSuccess()
+                    .bodyString()
 
-                    if (body.contains(PLAYER_ERROR_MARKER)) {
-                        emptyList()
-                    } else {
-                        parseVideos(Jsoup.parse(body, playerUrl), server, playerHeaders)
-                    }
+                if (body.contains(PLAYER_ERROR_MARKER)) {
+                    lastRejected = body.length
+                    emptyList()
+                } else {
+                    parseVideos(Jsoup.parse(body, playerUrl), server, playerHeaders)
                 }
             }.getOrDefault(emptyList())
 
@@ -318,7 +335,7 @@ class Kuramanime :
             if (videos.isNotEmpty()) return videos
         }
 
-        return emptyList()
+        fail("all ${servers.size} servers rejected (token=$token page=$page lastBody=$lastRejected)")
     }
 
     private suspend fun parseVideos(document: Document, server: String, videoHeaders: Headers): List<Video> {
@@ -355,6 +372,15 @@ class Kuramanime :
             else -> listOf(Video(iframe, server, iframe, videoHeaders))
         }
     }
+
+    /** `episode.url` is normally a path, but guard against a stored absolute URL or a missing slash. */
+    private fun joinUrl(path: String): String = when {
+        path.startsWith("http") -> path
+        path.startsWith("/") -> baseUrl + path
+        else -> "$baseUrl/$path"
+    }
+
+    private fun fail(reason: String): Nothing = throw IllegalStateException("Kuramanime: $reason")
 
     private fun qualityOf(url: String): String = QUALITY_REGEX.find(url)?.groupValues?.get(1)?.let { "${it}p" } ?: "Direct"
 
