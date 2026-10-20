@@ -1,11 +1,12 @@
 ext {
     extName = 'Samehadaku'
     extClass = '.Samehadaku'
-    extVersionCode = 11
+    extVersionCode = 12
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
-    implementation(project(":lib:bloggerextractor"))
+    implementation(project(":lib:megaextractor"))
+    implementation(project(":lib:vidhideextractor"))
 }
