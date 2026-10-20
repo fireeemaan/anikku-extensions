@@ -26,6 +26,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
@@ -45,25 +46,36 @@ class Samehadaku :
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/daftar-anime-2/page/$page/?order=popular")
+    override fun popularAnimeRequest(page: Int): Request = GET(listUrl(page, "popular"))
 
-    override fun popularAnimeParse(response: Response): AnimesPage = getAnimeParse(response.asJsoup(), "div.relat > article")
+    override fun popularAnimeParse(response: Response): AnimesPage = getAnimeParse(response.asJsoup(), LIST_SELECTOR)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/daftar-anime-2/page/$page/?order=update")
+    override fun latestUpdatesRequest(page: Int): Request = GET(listUrl(page, "update"))
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = getAnimeParse(response.asJsoup(), "div.relat > article")
+    override fun latestUpdatesParse(response: Response): AnimesPage = getAnimeParse(response.asJsoup(), LIST_SELECTOR)
+
+    /**
+     * `/daftar-anime-2/page/1/` is 301-redirected to `/daftar-anime-2/`, so the first page is
+     * requested without the paging segment.
+     */
+    private fun listUrl(page: Int, order: String): String = if (page <= 1) {
+        "$baseUrl/daftar-anime-2/?order=$order"
+    } else {
+        "$baseUrl/daftar-anime-2/page/$page/?order=$order"
+    }
 
     // ============================== Related ===============================
 
     override fun relatedAnimeListParse(response: Response): List<SAnime> {
         val document = response.asJsoup()
-        return document.select(".rand-animesu li").mapNotNull {
+        return document.select("div.recom-section article").mapNotNull { element ->
             SAnime.create().apply {
-                it.selectFirst("a")?.attr("href")?.let { url -> setUrlWithoutDomain(url) } ?: return@mapNotNull null
-                title = it.selectFirst(".judul")?.text() ?: return@mapNotNull null
-                thumbnail_url = it.selectFirst("img")?.attr("src")
+                val link = element.selectFirst("div.animposx > a[href]") ?: return@mapNotNull null
+                setUrlWithoutDomain(link.absUrl("href"))
+                title = element.selectFirst("div.title > h2")?.text()?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+                thumbnail_url = element.selectFirst("div.content-thumb > img")?.attr("src")
             }
         }
     }
@@ -84,15 +96,7 @@ class Samehadaku :
         return GET("$url${params.filter}", headers)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage {
-        val doc = response.asJsoup()
-        val searchSelector = "main.site-main.relat > article"
-        return if (doc.selectFirst(searchSelector) != null) {
-            getAnimeParse(doc, searchSelector)
-        } else {
-            getAnimeParse(doc, "div.relat > article")
-        }
-    }
+    override fun searchAnimeParse(response: Response): AnimesPage = getAnimeParse(response.asJsoup(), LIST_SELECTOR)
 
     // ============================== Filters ===============================
 
@@ -100,42 +104,43 @@ class Samehadaku :
 
     override fun animeDetailsParse(response: Response): SAnime {
         val doc = response.asJsoup()
-        val detail = doc.selectFirst("div.infox > div.spe")
 
-        val extractedGenres = doc.select("div.genre-info a")
-            .mapNotNull { it.text().takeIf(String::isNotBlank) }
-            .joinToString().takeIf(String::isNotBlank)
-            ?: detail?.selectFirst("span:has(b:contains(Genre))")?.let { genres: Element ->
-                genres.select("a")
-                    .mapNotNull { it.text().takeIf(String::isNotBlank) }
-                    .joinToString().takeIf(String::isNotBlank)
-                    ?: genres.text().substringAfter(":").trim()
-            }
+        // The detail page is a Tailwind layout: a "Nonton Anime <title>" card holds the poster,
+        // synopsis and genre chips, while a "Detail Anime <title>" card holds the info table.
+        val mainCard = doc.selectFirst("div.card:has(h2:contains(Nonton Anime))")
+        val infoCard = doc.selectFirst("div.card:has(h3:contains(Detail Anime))")
+
+        val infoRows = infoCard?.select("div > span")
+            ?.chunked(2)
+            ?.filter { it.size == 2 }
+            ?.associate { it[0].text().trim().removeSuffix(":") to it[1].text().trim() }
+            .orEmpty()
+
+        val title = (mainCard ?: doc).selectFirst("h2:contains(Nonton Anime)")?.text()
+            ?.substringAfter("Nonton Anime")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+            ?: doc.selectFirst("h1[itemprop=headline]")?.text()?.removeSuffix(" Sub Indo")?.trim()
+            ?: doc.selectFirst("h1.entry-title")?.text()?.removeSuffix(" Sub Indo")?.trim()
 
         return SAnime.create().apply {
-            author = detail?.getInfo("Studio") ?: ""
-            status = detail?.let { parseStatus(it.getInfo("Status")) } ?: SAnime.UNKNOWN
+            title?.let { this.title = it }
+            author = infoRows["Studio"].orEmpty()
+            status = parseStatus(infoRows["Status"])
 
-            (
-                doc.selectFirst("h3.anim-detail")?.text()?.split("Detail Anime")?.getOrNull(1)
-                    ?: doc.selectFirst("h2.entry-title[itemprop='partOfSeries']")?.text()?.removeSurrounding("Sinopsis Anime", "Indo")
-                    ?: doc.selectFirst("h1.entry-title")?.text()?.removeSuffix("Sub Indo")
-                )
-                ?.trim()?.let { title = it }
+            thumbnail_url = mainCard?.selectFirst("img[alt]")?.attr("src")
+                ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
 
-            (
-                doc.selectFirst("div.infoanime.widget_senction > div.thumb > img")?.attr("src")
-                    ?: doc.selectFirst("div.episodeinf > div.infoanime > div.areainfo > div.thumb > img")?.attr("src")
-                )
-                .let { thumbnail_url = it }
+            description = mainCard?.selectFirst("div.entry-content p")?.text()
+                ?: doc.selectFirst("meta[property=og:description]")?.attr("content")
 
-            (
-                doc.selectFirst("div.entry-content.entry-content-single > p")?.text()
-                    ?: doc.selectFirst("div.desc > div.entry-content.entry-content-single")?.text()
-                )
-                .let { description = it }
-
-            extractedGenres?.let { genre = it }
+            val genres = mainCard?.select("a[href*=/genre/]")
+                ?.eachText()
+                ?.map(String::trim)
+                ?.filter(String::isNotBlank)
+                ?.distinct()
+                .orEmpty()
+            if (genres.isNotEmpty()) genre = genres.joinToString()
         }
     }
 
@@ -143,18 +148,17 @@ class Samehadaku :
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val doc = response.asJsoup()
-        return doc.select("div.lstepsiode > ul > li")
-            .mapNotNull {
-                val episode = it.selectFirst("span.eps > a") ?: return@mapNotNull null
-                SEpisode.create().apply {
-                    setUrlWithoutDomain(episode.attr("href"))
-                    episode_number = episode.text().trim().toFloatOrNull() ?: 1F
-                    name = it.selectFirst("span.lchx > a")?.text() ?: return@mapNotNull null
-                    date_upload = it.selectFirst("span.date")?.text()
-                        ?.let { date -> DATE_FORMATTER.tryParse(date) }
-                        ?: 0L
-                }
+        return doc.select("div.custom-scrollbar > div").mapNotNull { row ->
+            val link = row.selectFirst("h4 a[href]") ?: return@mapNotNull null
+            SEpisode.create().apply {
+                setUrlWithoutDomain(link.absUrl("href").ifBlank { link.attr("href") })
+                name = link.text().trim()
+                episode_number = row.selectFirst("div.shrink-0 a")?.text()?.trim()?.toFloatOrNull()
+                    ?: name.filter(Char::isDigit).toFloatOrNull()
+                    ?: 1F
+                date_upload = row.selectFirst("span")?.text()?.trim()?.let(DATE_FORMATTER::tryParse) ?: 0L
             }
+        }
     }
 
     // ============================ Video Links =============================
@@ -179,19 +183,14 @@ class Samehadaku :
         return sortedWith(compareByDescending { it.videoTitle.contains(quality) })
     }
 
-    private fun Element.getInfo(info: String, cut: Boolean = true): String? = selectFirst("span:has(b:contains($info))")?.text()
-        ?.let {
-            when {
-                cut -> it.substringAfter(" ")
-                else -> it
-            }.trim()
-        }
-
     private fun getAnimeParse(document: Document, query: String): AnimesPage {
         val animes = document.select(query).mapNotNull { elm ->
             SAnime.create().apply {
-                elm.selectFirst("div > a")?.attr("href")?.let { setUrlWithoutDomain(it) } ?: return@mapNotNull null
-                title = elm.selectFirst("div.title > h2")?.text() ?: return@mapNotNull null
+                val link = elm.selectFirst("div.animposx > a[href]") ?: elm.selectFirst("a[href]")
+                link?.absUrl("href")?.takeIf(String::isNotBlank)?.let { setUrlWithoutDomain(it) }
+                    ?: return@mapNotNull null
+                title = elm.selectFirst("div.title > h2")?.text()?.takeIf(String::isNotBlank)
+                    ?: return@mapNotNull null
                 elm.selectFirst("div.content-thumb > img")?.attr("src")?.let { thumbnail_url = it }
             }
         }
@@ -212,7 +211,20 @@ class Samehadaku :
         else -> SAnime.UNKNOWN
     }
 
+    /**
+     * The player servers are rendered inline as `data-embed` iframe markup, so no AJAX round-trip is
+     * needed anymore. The `admin-ajax.php` request is kept as a fallback for pages that still use
+     * the legacy `data-type` flow.
+     */
     private suspend fun getEmbedLinks(url: String, element: Element): Pair<String, String> {
+        val server = element.selectFirst("span")?.text()?.trim().orEmpty()
+
+        element.attr("data-embed")
+            .takeIf(String::isNotBlank)
+            ?.let { Jsoup.parse(it).selectFirst("iframe[src]")?.attr("src") }
+            ?.takeIf(String::isNotBlank)
+            ?.let { return Pair(server, it) }
+
         val form = FormBody.Builder().apply {
             add("action", "player_ajax")
             add("post", element.attr("data-post"))
@@ -228,13 +240,14 @@ class Samehadaku :
             .awaitSuccess()
             .bodyString()
             .let {
-                val link = srcRegex.find(it)?.groupValues[1]?.takeIf(String::isNotBlank)!!
-                val server = element.selectFirst("span")?.text() ?: ""
+                val link = srcRegex.find(it)?.groupValues?.get(1)?.takeIf(String::isNotBlank) ?: ""
                 Pair(server, link)
             }
     }
 
     private suspend fun getVideosFromEmbed(server: String, link: String): List<Video> {
+        if (link.isBlank()) return emptyList()
+
         val videoHeaders = headers.newBuilder()
             .set("User-Agent", USER_AGENT)
             .add("Referer", link)
@@ -264,7 +277,7 @@ class Samehadaku :
             }
 
             // Blogger — now delegates entirely to BloggerExtractor
-            "blogger" in link -> bloggerExtractor.videosFromUrl(link, headers, server)
+            "blogger" in link || "blogspot" in link -> bloggerExtractor.videosFromUrl(link, headers, server)
 
             else -> {
                 val doc = client.newCall(GET(link, videoHeaders)).awaitSuccess().useAsJsoup()
@@ -290,6 +303,8 @@ class Samehadaku :
     }
 
     companion object {
+        private const val LIST_SELECTOR = "div.relat article"
+
         private val DATE_FORMATTER by lazy {
             SimpleDateFormat("d MMMM yyyy", Locale("id", "ID"))
         }
