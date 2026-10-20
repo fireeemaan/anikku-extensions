@@ -201,6 +201,9 @@ class Kuramanime :
     private val filemoonExtractor by lazy { FilemoonExtractor(client) }
     private val vidguardExtractor by lazy { VidGuardExtractor(client) }
 
+    /** Filled in by [fetchEnv] so a failure can say *why* instead of just "empty". */
+    private var envDiagnostic = "not attempted"
+
     /**
      * The whole player flow lives here instead of in `videoListParse` because everything past the
      * first request is asynchronous: the base shim declares `videoListParse` as a plain function, so
@@ -220,8 +223,9 @@ class Kuramanime :
      * 4. `GET /<MIX_PREFIX_AUTH_ROUTE_PARAM><MIX_AUTH_ROUTE_PARAM>` with `X-Fuck-ID` -> the token.
      * 5. `POST <episodeUrl>?<token>=…&<server>=…&page=…` with `authorization` in the body.
      *
-     * Each step throws with a short reason when it cannot proceed, so a failure shows up in the app as
-     * a readable message instead of a silent empty list.
+     * The `MIX_*` **values** are constant for a given build of the site — only the generated
+     * `<data-kk>` filename rotates — so [ENV_DEFAULTS] is used whenever the asset fetch does not
+     * return all of them. That keeps a flaky/blocked asset request from breaking playback.
      */
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val episodeUrl = joinUrl(episode.url)
@@ -238,15 +242,11 @@ class Kuramanime :
         val jsRouteParam = doc.selectFirst("[$JS_ROUTE_ATTR]")?.attr(JS_ROUTE_ATTR)
             ?: fail("episode page has no [$JS_ROUTE_ATTR]")
 
+        val cookie = cookies.toCookieHeader()
+
         val page = runCatching {
             client.newCall(
-                GET(
-                    checkUrl,
-                    headersBuilder()
-                        .set("X-Requested-With", "XMLHttpRequest")
-                        .set("Cookie", cookies.toCookieHeader())
-                        .build(),
-                ),
+                GET(checkUrl, headersWithCookie(cookie, "X-Requested-With" to "XMLHttpRequest")),
             )
                 .awaitSuccess()
                 .use { it.cookiesInto(cookies) }
@@ -254,53 +254,46 @@ class Kuramanime :
                 .ifBlank { "1" }
         }.getOrDefault("1")
 
-        val env = runCatching {
-            client.newCall(
-                GET(
-                    "$baseUrl/assets/js/$jsRouteParam.js",
-                    headersBuilder().set("Cookie", cookies.toCookieHeader()).build(),
-                ),
-            )
-                .awaitSuccess()
-                .bodyString()
-                .let(::parseEnv)
-        }.getOrNull().orEmpty()
+        // Fetch the generated env asset, but never let its absence break playback: the values are
+        // stable per site build, so fall back to the known set.
+        val env = ENV_DEFAULTS + fetchEnv(jsRouteParam, cookie)
 
-        if (env.isEmpty()) fail("env JS is empty (data-kk=$jsRouteParam)")
-
-        val tokenParam = env["MIX_PAGE_TOKEN_KEY"] ?: fail("env has no MIX_PAGE_TOKEN_KEY")
-        val serverParam = env["MIX_STREAM_SERVER_KEY"] ?: fail("env has no MIX_STREAM_SERVER_KEY")
+        val tokenParam = env["MIX_PAGE_TOKEN_KEY"] ?: fail("env has no MIX_PAGE_TOKEN_KEY ($envDiagnostic)")
+        val serverParam = env["MIX_STREAM_SERVER_KEY"] ?: fail("env has no MIX_STREAM_SERVER_KEY ($envDiagnostic)")
         val authPath = (env["MIX_PREFIX_AUTH_ROUTE_PARAM"] ?: "") + (env["MIX_AUTH_ROUTE_PARAM"] ?: "")
-        if (authPath.isBlank()) fail("env has no auth route params")
+        if (authPath.isBlank()) fail("env has no auth route params ($envDiagnostic)")
 
         val token = runCatching {
-            val tokenHeaders = headersBuilder()
-                .set("X-Fuck-ID", "${env["MIX_AUTH_KEY"].orEmpty()}:${env["MIX_AUTH_TOKEN"].orEmpty()}")
-                .set("X-Request-ID", getRandomString(6))
-                .set("X-Request-Index", "0")
-                .set("Cookie", cookies.toCookieHeader())
-                .build()
-
-            client.newCall(GET("$baseUrl/$authPath", tokenHeaders))
+            client.newCall(
+                GET(
+                    "$baseUrl/$authPath",
+                    headersWithCookie(
+                        cookie,
+                        "X-Fuck-ID" to "${env["MIX_AUTH_KEY"].orEmpty()}:${env["MIX_AUTH_TOKEN"].orEmpty()}",
+                        "X-Request-ID" to getRandomString(6),
+                        "X-Request-Index" to "0",
+                    ),
+                ),
+            )
                 .awaitSuccess()
                 .use { it.cookiesInto(cookies) }
                 .trim('"', ' ', '\n', '\r')
         }.getOrNull().orEmpty()
 
-        if (token.isBlank()) fail("token request returned blank ($authPath)")
+        if (token.isBlank()) fail("token request returned blank (/ $authPath, $envDiagnostic)")
 
         val servers = doc.select("select#changeServer > option")
             .map { it.attr("value") }
             .filter(String::isNotBlank)
         if (servers.isEmpty()) fail("episode page has no select#changeServer options")
 
-        val playerHeaders = headersBuilder()
-            .set("Referer", episodeUrl)
-            .set("X-Requested-With", "XMLHttpRequest")
-            .set("X-CSRF-TOKEN", csrfToken)
-            .set("Accept", "text/html, */*; q=0.01")
-            .set("Cookie", cookies.toCookieHeader())
-            .build()
+        val playerHeaders = headersWithCookie(
+            cookies.toCookieHeader(),
+            "Referer" to episodeUrl,
+            "X-Requested-With" to "XMLHttpRequest",
+            "X-CSRF-TOKEN" to csrfToken,
+            "Accept" to "text/html, */*; q=0.01",
+        )
 
         // The server validates the value, not just its presence: a random string is rejected, so this
         // is a shared constant rather than a per-request nonce. Keep it in one place.
@@ -335,7 +328,7 @@ class Kuramanime :
             if (videos.isNotEmpty()) return videos
         }
 
-        fail("all ${servers.size} servers rejected (token=$token page=$page lastBody=$lastRejected)")
+        fail("all ${servers.size} servers rejected (token=$token page=$page lastBody=$lastRejected $envDiagnostic)")
     }
 
     private suspend fun parseVideos(document: Document, server: String, videoHeaders: Headers): List<Video> {
@@ -371,6 +364,41 @@ class Kuramanime :
             "vidguard" in iframe -> vidguardExtractor.videosFromUrl(iframe)
             else -> listOf(Video(iframe, server, iframe, videoHeaders))
         }
+    }
+
+    /**
+     * Reads `window.process.env` out of the generated `/assets/js/<data-kk>.js`. Returns an empty map
+     * on any failure and records the reason in [envDiagnostic]; the caller merges [ENV_DEFAULTS] so a
+     * failure degrades to the known-good values instead of aborting.
+     */
+    private suspend fun fetchEnv(jsRouteParam: String, cookie: String): Map<String, String> {
+        val url = "$baseUrl/assets/js/$jsRouteParam.js"
+        return runCatching {
+            val response = client.newCall(GET(url, headersWithCookie(cookie))).awaitSuccess()
+            try {
+                val body = response.body?.string().orEmpty()
+                val env = parseEnv(body)
+                envDiagnostic = "envAsset=${body.length}B/${env.size}keys"
+                env
+            } finally {
+                response.close()
+            }
+        }.getOrElse { error ->
+            envDiagnostic = "envAsset ${error::class.simpleName}: ${error.message}"
+            emptyMap()
+        }
+    }
+
+    /**
+     * Builds request headers from the source's default headers plus extra pairs. Uses
+     * `Headers.newBuilder()` (plain OkHttp) so the result is independent of whatever the shared
+     * helper builds, and skips an empty `Cookie` instead of sending a blank one.
+     */
+    private fun headersWithCookie(cookie: String, vararg extra: Pair<String, String>): Headers {
+        val builder = headers.newBuilder()
+        if (cookie.isNotEmpty()) builder.set("Cookie", cookie)
+        extra.forEach { (key, value) -> builder.set(key, value) }
+        return builder.build()
     }
 
     /** `episode.url` is normally a path, but guard against a stored absolute URL or a missing slash. */
@@ -448,6 +476,20 @@ class Kuramanime :
 
         /** Validated server-side, stable across sessions and episodes — not a per-request nonce. */
         private const val AUTH_SIGNATURE = "kJuHHkaqcBFXiGMHQf6bJw8YAyDcwGD8Ur"
+
+        /**
+         * `window.process.env` as served in `/assets/js/<data-kk>.js`. Only the generated filename
+         * rotates; these six values are constant for a given site build, so they double as a fallback
+         * when that asset cannot be fetched.
+         */
+        private val ENV_DEFAULTS = mapOf(
+            "MIX_PREFIX_AUTH_ROUTE_PARAM" to "assets/",
+            "MIX_AUTH_ROUTE_PARAM" to "Ks6sqSgloPTlHMl.txt",
+            "MIX_AUTH_KEY" to "rFj8fp1nxMuNfKq",
+            "MIX_AUTH_TOKEN" to "ijjAwj6Jze0kscx",
+            "MIX_PAGE_TOKEN_KEY" to "Ub3BzhijicHXZdv",
+            "MIX_STREAM_SERVER_KEY" to "C2XAPerzX1BM7V9",
+        )
 
         private val ENV_BLOCK_REGEX by lazy { Regex("""env:\s*\{([\s\S]*?)}""") }
         private val ENV_VAR_REGEX by lazy { Regex("""(\w+)\s*:\s*['"]([^'"]+)['"]""") }
