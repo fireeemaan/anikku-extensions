@@ -13,11 +13,13 @@ import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import keiyoushi.utils.ParsedAnimeHttpLegacySource
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.useAsJsoup
 import kotlinx.coroutines.runBlocking
+import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -200,12 +202,26 @@ class Kuramanime :
     private val vidguardExtractor by lazy { VidGuardExtractor(client) }
 
     /**
-     * The player is no longer served as a plain `<source>` list. The episode page now hands out a
-     * per-session token through a dynamically generated JS file (`[data-kk]` -> `/assets/js/<id>.js`
-     * which defines `window.process.env`), and the player markup only comes back when the request
-     * carries `?<MIX_PAGE_TOKEN_KEY>=<token>&<MIX_STREAM_SERVER_KEY>=<server>&page=<n>`.
+     * The player markup is gated behind a per-session token that the page hands out in two steps, and
+     * the endpoint that finally returns the markup **only accepts `POST`** carrying an `authorization`
+     * form field. Issuing a `GET` (or a POST with an empty body) is answered with the rejection panel
+     * for every server, which is what made this source look permanently dead.
+     *
+     * 1. `meta[name=csrf-token]`, `input#checkEp` (its value is the page-index endpoint) and
+     *    `[data-kk]` (id of the generated JS holding `window.process.env`) come from the episode page.
+     * 2. `GET #checkEp` -> the page index as a bare number.
+     * 3. `GET /assets/js/<data-kk>.js` -> the `MIX_*` names used by the two query parameters below.
+     * 4. `GET /<MIX_PREFIX_AUTH_ROUTE_PARAM><MIX_AUTH_ROUTE_PARAM>` with `X-Fuck-ID` -> the token.
+     * 5. `POST <episodeUrl>?<token>=…&<server>=…&page=…` with `authorization` in the body.
+     *
+     * Step 5 is also rejected unless the request carries the session cookie handed out by the episode
+     * page, so the cookies are harvested from `Set-Cookie` and replayed explicitly instead of relying
+     * on the shared client's cookie jar.
      */
     override fun videoListParse(response: Response): List<Video> {
+        val cookies = mutableMapOf<String, String>()
+        cookies.harvest(response)
+
         val doc = response.useAsJsoup()
         val episodeUrl = response.request.url
 
@@ -214,9 +230,17 @@ class Kuramanime :
         val jsRouteParam = doc.selectFirst("[$JS_ROUTE_ATTR]")?.attr(JS_ROUTE_ATTR) ?: return emptyList()
 
         val page = runCatching {
-            client.newCall(GET(checkUrl, headers.newBuilder().set("X-Requested-With", "XMLHttpRequest").build()))
+            client.newCall(
+                GET(
+                    checkUrl,
+                    headersBuilder()
+                        .set("X-Requested-With", "XMLHttpRequest")
+                        .set("Cookie", cookies.toCookieHeader())
+                        .build(),
+                ),
+            )
                 .execute()
-                .bodyString()
+                .use { it.cookiesInto(cookies) }
                 .filter(Char::isDigit)
                 .ifBlank { "1" }
         }.getOrDefault("1")
@@ -238,11 +262,12 @@ class Kuramanime :
                 .set("X-Fuck-ID", "${env["MIX_AUTH_KEY"].orEmpty()}:${env["MIX_AUTH_TOKEN"].orEmpty()}")
                 .set("X-Request-ID", getRandomString(6))
                 .set("X-Request-Index", "0")
+                .set("Cookie", cookies.toCookieHeader())
                 .build()
 
             client.newCall(GET("$baseUrl/$authPath", tokenHeaders))
                 .execute()
-                .bodyString()
+                .use { it.cookiesInto(cookies) }
                 .trim('"', ' ', '\n', '\r')
         }.getOrNull().orEmpty()
         if (token.isBlank()) return emptyList()
@@ -256,10 +281,16 @@ class Kuramanime :
             .set("Referer", episodeUrl.toString())
             .set("X-Requested-With", "XMLHttpRequest")
             .set("X-CSRF-TOKEN", csrfToken)
+            .set("Accept", "text/html, */*; q=0.01")
+            .set("Cookie", cookies.toCookieHeader())
             .build()
 
-        // The player endpoint is single-shot per episode, so stop at the first server that actually
-        // returns a playable source instead of burning every server in one go.
+        // The server validates the value, not just its presence: a random string is rejected, so this
+        // is a shared constant rather than a per-request nonce. Keep it in one place.
+        val authBody = FormBody.Builder()
+            .add("authorization", AUTH_SIGNATURE)
+            .build()
+
         for (server in servers) {
             val playerUrl = episodeUrl.newBuilder()
                 .addQueryParameter(tokenParam, token)
@@ -268,39 +299,49 @@ class Kuramanime :
                 .build()
                 .toString()
 
-            val result = runCatching {
+            val videos = runCatching {
                 runBlocking {
-                    val body = client.newCall(GET(playerUrl, playerHeaders)).execute().bodyString()
-                    val videos = parseVideos(Jsoup.parse(body, playerUrl), server, playerHeaders)
-                    videos to body.contains(PLAYER_ERROR_MARKER)
-                }
-            }.getOrNull() ?: continue
+                    val body = client.newCall(POST(playerUrl, body = authBody, headers = playerHeaders))
+                        .execute()
+                        .bodyString()
 
-            if (result.first.isNotEmpty()) return result.first
-            // The endpoint answers with an explicit "failed to fetch the video" panel for requests it
-            // rejects; trying the remaining servers would only repeat the same rejection.
-            if (result.second) return emptyList()
+                    if (body.contains(PLAYER_ERROR_MARKER)) {
+                        emptyList()
+                    } else {
+                        parseVideos(Jsoup.parse(body, playerUrl), server, playerHeaders)
+                    }
+                }
+            }.getOrDefault(emptyList())
+
+            // Stop at the first server that actually yields a playable source; the endpoint is
+            // single-shot per episode and repeats the same rejection for every server.
+            if (videos.isNotEmpty()) return videos
         }
 
         return emptyList()
     }
 
     private suspend fun parseVideos(document: Document, server: String, videoHeaders: Headers): List<Video> {
+        val videos = mutableListOf<Video>()
+
         val player = document.selectFirst("video#player")
 
+        // `data-hls-src` is empty for the kuramadrive server, so it must not be emitted blindly.
         val hls = player?.attr("data-hls-src")?.takeIf(String::isNotBlank)
-        val source = player?.attr("src")?.takeIf(String::isNotBlank)
+        val direct = player?.attr("src")?.takeIf(String::isNotBlank)
 
-        val videos = mutableListOf<Video>()
         if (hls != null) videos += Video(hls, "$server - HLS", hls, videoHeaders)
-        if (source != null) videos += Video(source, "$server - ${qualityOf(source)}", source, videoHeaders)
-        if (videos.isNotEmpty()) return videos
+        if (direct != null) videos += Video(direct, "$server - ${qualityOf(direct)}", direct, videoHeaders)
 
-        document.select("video#player source[src], div.video-content source[src]")
-            .map { it.attr("src") }
-            .filter(String::isNotBlank)
-            .forEach { videos += Video(it, "$server - ${qualityOf(it)}", it, videoHeaders) }
-        if (videos.isNotEmpty()) return videos
+        // Each quality is a separate <source size="720">; Jsoup decodes the `&amp;` in `src` for us.
+        document.select("video#player source[src], div.video-content source[src]").forEach { source ->
+            val url = source.attr("src").takeIf(String::isNotBlank) ?: return@forEach
+            val quality = source.attr("size").trim().takeIf(String::isNotBlank)?.let { "${it}p" }
+                ?: qualityOf(url)
+            videos += Video(url, "$server - $quality", url, videoHeaders)
+        }
+
+        if (videos.isNotEmpty()) return videos.distinctBy { it.videoUrl }
 
         val iframe = document.selectFirst("div.video-content iframe[src]")?.attr("src")
             ?: document.selectFirst("#animeVideoPlayer iframe[src]")?.attr("src")
@@ -321,6 +362,22 @@ class Kuramanime :
         val envBlock = ENV_BLOCK_REGEX.find(script)?.groupValues?.get(1) ?: return emptyMap()
         return ENV_VAR_REGEX.findAll(envBlock).associate { it.groupValues[1] to it.groupValues[2] }
     }
+
+    /** Reads the body and folds any `Set-Cookie` the response carried into [cookies]. */
+    private fun Response.cookiesInto(cookies: MutableMap<String, String>): String {
+        cookies.harvest(this)
+        return bodyString()
+    }
+
+    private fun MutableMap<String, String>.harvest(response: Response) {
+        response.headers("Set-Cookie").forEach { raw ->
+            val name = raw.substringBefore('=').trim()
+            val value = raw.substringAfter('=', "").substringBefore(';').trim()
+            if (name.isNotEmpty() && value.isNotEmpty()) put(name, value)
+        }
+    }
+
+    private fun Map<String, String>.toCookieHeader(): String = entries.joinToString("; ") { "${it.key}=${it.value}" }
 
     private fun getRandomString(length: Int = 8): String {
         val allowedChars = ('a'..'z') + ('A'..'Z') + ('0'..'9')
@@ -362,6 +419,9 @@ class Kuramanime :
         private const val ANIME_SELECTOR = "div#animeList div.filter__gallery > a, div#animeList div.product__item"
         private const val JS_ROUTE_ATTR = "data-kk"
         private const val PLAYER_ERROR_MARKER = "Terjadi kesalahan saat mengambil video"
+
+        /** Validated server-side, stable across sessions and episodes — not a per-request nonce. */
+        private const val AUTH_SIGNATURE = "kJuHHkaqcBFXiGMHQf6bJw8YAyDcwGD8Ur"
 
         private val ENV_BLOCK_REGEX by lazy { Regex("""env:\s*\{([\s\S]*?)}""") }
         private val ENV_VAR_REGEX by lazy { Regex("""(\w+)\s*:\s*['"]([^'"]+)['"]""") }
